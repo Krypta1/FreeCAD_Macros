@@ -1,0 +1,402 @@
+#============================================================================
+#                                               Macro de génération automatique d'helice
+#============================================================================
+
+# Attention n°1 : Inutilisable sans un profil d'aile/hydrofoil adéquat tel que le e817 fourni
+# Attention n°2 : Les normales du cylindre d'arbre d'helice sont inversees, il faudra donc
+#			    penser à corriger le STL
+
+# Pour utiliser un profil different s'assurer
+#		1) Qu'il se termine en un seul et unique point
+#		2) Que le fichiers csv contenant les coordonnees du profil n'a pas de ligne en double
+
+# Documentation sur les helices : https://heliciel.com/helice/geometrie-helice.htm
+
+# Ce script est fourni fonctionnel en l'état mais peut être amélioré / adapté à loisir !
+# P.S : Pensez à la communauté ! Si vous y ajoutez des bonnes idees partagez !
+
+#============================================================================
+#============================================================================
+
+#=====================
+# Librairies utilisées par la macro
+#=====================
+import FreeCAD
+import Draft
+import Part
+import numpy as np
+import csv
+import BOPTools#.JoinFeatures
+import CompoundTools#.CompoundFilter
+
+#================
+# Variables / Parametres
+#================
+
+# Chemin du profil de pale (a remplacer par le votre)
+profil_path = 'D:\cleme\Documents\Projets\Sous-marin\e817-il-m2.csv'
+
+rake_angle = 0.			# Angle de Rake (°)
+rake_distrib = "droite"		# Distribution du rake "cercle" ou "droite"
+skew_angle = 30.			# Angle de Skew (°)
+skew_distrib = "cercle"		# Distribution du skew "cercle" ou "droite"
+ext_pitch = 180			# Pas de l'helice sur son diametre exterieur (mm)
+sens_helice = "trigo"		# Sens de rotation de l'helice "trigo" ou "horaire"
+n_pales = 3				# Nombre de pales (2 minimum)
+offset_cyl = 5				# Jeu entre les extremites du pied de pale et les extremites du cylindre porteur
+d_arbre = 20				# Diametre de l'arbre d'helice
+
+# Description des sections (a remplir du centre vers l'exterieur)
+# | Longueur de corde (mm) | Position du foyer (%) | Rayon (mm) -> Position vis-a-vis du centre de l'helice |
+
+# Attention n°3 : Le 1er profil doit avoir un rayon 1mm plus petit que le rayon de pied de pale prevu (ex : 19 pour 20)
+# Attention n°3 : Le dernier profil doit avoir un rayon 1mm plus grand que le rayon de bout de pale prevu (ex : 101 pour 100)
+sections = np.array([[30.,0.25,19.],
+				  [60.,0.25,60.],
+				  [30.,0.25,101.]])
+
+# Rayon de pied et de bout de pale (valeurs automatiques donc pas touche !)
+r_p = min(sections[:,2])
+r_e = max(sections[:,2])
+
+#=======================
+# Fonction d'import du profil de pale
+#=======================
+def csv_profil(path, corde, foyer):
+	# Ouverture du fichier csv et lecture des donnees
+	fichier_csv = open(path, newline='')
+	profil_reader = csv.reader(fichier_csv, delimiter=",")
+	# Récupération des valeurs (list)
+	list_profil = list(profil_reader)
+	# Fermeture du fichier csv
+	fichier_csv.close()
+	# Construction de la matrice de coordonnées
+	profil_csv = np.array(list_profil).astype("float")
+	profil = (profil_csv - (np.array([[1.,0.] for i in range(np.size(profil_csv,0))]).astype("float")*(foyer)))*corde
+	to_xyz =np.array([[1.,0.,0.],
+				      [0.,1.,0]])
+
+	profil_xyz = np.dot(profil, to_xyz)
+	return profil_xyz
+
+#==============================
+# Fonction de rotation autour d'un axe x, y ou z
+#==============================
+def rotate(coord, angle, axe):
+	angle_r = np.radians(angle)
+	if axe == "x":
+		mat = np.array([[1.,-0.,0.],
+					   [0.,np.cos(angle_r),np.sin(angle_r)],
+					   [0.,-np.sin(angle_r),np.cos(angle_r)]])
+	elif axe == "y":
+		mat = np.array([[np.cos(angle_r),-0.,np.sin(angle_r)],
+					   [0.,1.,0.],
+					   [-np.sin(angle_r),0.,np.cos(angle_r)]])
+	elif axe == "z":
+		mat = np.array([[np.cos(angle_r),np.sin(angle_r),0.],
+					   [-np.sin(angle_r),np.cos(angle_r),0.],
+					   [0.,0.,1.]])
+	else:
+		print("Error : No valid axis entered")
+	result = np.dot(coord,mat)
+	return result
+
+#○==========================
+# Fonction pour déterminer l'angle du pas
+#===========================
+def pitch(r_i, r_e, p_total):
+	tan_t = (p_total*r_e)/(2*np.pi*(r_i**2))
+	pitch = np.degrees(np.arctan(tan_t))
+	return pitch
+
+#=================================
+# Fonction de mappage sur cylindre de rayon donné
+#=================================
+def cylinder(coord, r, plane, support):
+	result = np.empty((0,3),dtype="float")
+	for row in coord:
+		x_coord = row[0]
+		y_coord = row[1]
+		z_coord = row[2]
+		if plane == "yz" and support == "z":
+			theta = z_coord/r
+			x_new = x_coord
+			y_new = r*np.cos(theta)
+			z_new = r*np.sin(theta)
+		elif plane == "yz" and support == "y":
+			theta = y_coord/r
+			x_new = x_coord
+			y_new = r*np.sin(theta)
+			z_new = r*np.cos(theta)
+		elif plane == "xz" and support == "z":
+			theta = z_coord/r
+			x_new = r*np.cos(theta)
+			y_new = y_coord
+			z_new = r*np.sin(theta)
+		elif plane == "xz" and support == "x":
+			theta = x_coord/r
+			x_new = r*np.sin(theta)
+			y_new = y_coord
+			z_new = r*np.cos(theta)
+		elif plane == "xy" and support == "x":
+			theta = x_coord/r
+			x_new = r-np.sin(theta)
+			y_new = r*np.cos(theta)
+			z_new = z_coord
+		elif plane == "xy" and support == "y":
+			theta = y_coord/r
+			x_new = r*np.cos(theta)
+			y_new = r*np.sin(theta)
+			z_new = z_coord
+		point = [float(x_new),float(y_new),float(z_new)]
+		result = np.vstack ((result, point))
+	return result
+
+#==============================
+# Fonction déterminant le décalage du au Rake
+#==============================
+def rake(coord, angle, r_i, r_p, r_e, distrib):
+	if distrib == "droite":
+		delta_y = -r_i*np.tan(np.radians(angle))
+	elif distrib == "cercle":
+		r = (r_e-r_p)/np.sin(2*np.radians(angle))
+		gamma = np.arcsin((r_i-r_p)/r)
+		delta_y = -r*(np.cos(gamma)-1)
+	rake_d = np.array([[0.,1.,0.] for i in range(np.size(coord,0))]).astype("float")*delta_y
+	return rake_d
+
+#==========================
+# Fonction pour prise en compte du skew
+#==========================
+def skew(angle,r_i, r_p, r_e, distrib):
+	if angle >0:
+		a = (4*(np.sin(np.radians(angle))**4))+(np.sin(2*np.radians(angle))**2)
+		b = 2*r_p*np.sin(2*np.radians(angle))
+		c = (r_p**2)-(r_e**2)
+		delta = (b**2)-(4*a*c)
+		r = (-b+np.sqrt(delta))/(2*a)
+		u = 2*r*np.sin(np.radians(angle))
+		if distrib == "droite":
+			delta_x = ((u*r_i)/r_e)*np.sin(np.radians(angle))
+			delta_y = 0
+			delta_z = r_i-(((u*r_i)/r_e)*np.cos(np.radians(angle)))
+		elif distrib == "cercle":
+			delta_x = r*(1-np.cos(2*((r_i-r_p)/r_e)*np.radians(angle)))
+			delta_y = 0
+			delta_z = r_p+(r*np.sin(2*((r_i-r_p)/r_e)*np.radians(angle)))
+		epsilon = np.degrees(np.arctan(delta_x/delta_z))
+		return epsilon
+	else:
+		return 0.
+
+#================================
+# Fonction de symétrie pour helice horaire ou trigo
+#================================
+def trigornot(mode):
+	if mode == "trigo":
+		mat = np.array([[1.,0.,0.],
+					   [0.,1.,0.],
+					   [0.,0.,1.]])
+	elif mode == "horaire":
+		mat = np.array([[-1.,0.,0.],
+					   [0.,1.,0.],
+					   [0.,0.,1.]])
+	return mat
+#======================================================
+# Fonction de création d'une BSpline en fonction de la matrice de coordonnées fournie
+#======================================================
+def BSpline_Gen(coord):
+	S_points = []
+
+	for row in coord:
+		x_coord = row[0]
+		y_coord = row[1]
+		z_coord = row[2]
+		point = FreeCAD.Vector(float(x_coord),float(y_coord),float(z_coord))
+		S_points.append(point)
+
+	obj = Draft.makeBSpline(S_points, face=False)
+	return obj
+
+#==============================================================================
+# Algorithme principal
+#==============================================================================
+
+# Variables a initialiser
+top_loft = []
+bottom_loft = []
+start_loft = []
+end_loft = []
+i = 0
+i_max = sections.shape[0]
+
+# Groupes pour stocker les profils
+App.ActiveDocument.addObject("App::DocumentObjectGroup","Profils_Top")
+App.ActiveDocument.addObject("App::DocumentObjectGroup","Profils_Bottom")
+
+for row in sections:
+	corde = row[0]
+	foyer = row[1]	
+	r_i = row[2]
+	profil = csv_profil(profil_path, corde, foyer)
+	min_pos = np.argmin(profil,axis=0)[0]
+	# Rotation sur z pour prise en compte du pas
+	pitch_i = pitch(r_i, r_e, ext_pitch)
+	profil_r = rotate(profil, -pitch_i, "z")
+	# Profil enveloppe sur cylindre
+	profil_cyl = cylinder(profil_r, r_i, "xz", "x")
+	# Translation du profil sur Y pour prise en compte du rake
+	profil_rake = profil_cyl - rake(profil_cyl, rake_angle, r_i, r_p, r_e, rake_distrib)
+	# Angle de skew et rotation du profil autour de Y en consequence
+	skew_agl = skew(skew_angle,r_i, r_p, r_e, skew_distrib)
+	profil_skew = rotate(profil_rake, -skew_agl, "y")
+	# Profil final complet (inf+sup)
+	profil_final = np.dot(profil_skew,trigornot(sens_helice))
+	# Coordonnees profil superieur
+	profil_up = profil_final[:min_pos+1,:]
+	# Coordonnees profil inferieur
+	profil_down = profil_final[min_pos:,:]
+	# Profils supérieurs et inférieurs
+	top = BSpline_Gen(profil_up)
+	bottom = BSpline_Gen(profil_down)
+	if i == 0:
+		# Chemin du pied de pale
+		start_loft.append(App.ActiveDocument.getObject(top.Label))
+		start_loft.append(App.ActiveDocument.getObject(bottom.Label))
+		# Maxi et mini sur Y pour hauteur du cylindre de pied de pale
+		max_p = max(profil_final[:,1])
+		min_p = min(profil_final[:,1])
+		h_cyl = max_p-min_p
+	elif i == i_max-1:
+		# Chemin du bout de pale
+		end_loft.append(App.ActiveDocument.getObject(top.Label))
+		end_loft.append(App.ActiveDocument.getObject(bottom.Label))
+	# Chemin pour la surface supérieure
+	top_loft.append(App.ActiveDocument.getObject(top.Label))
+	App.ActiveDocument.getObject("Profils_Top").addObject(App.ActiveDocument.getObject(top.Label))
+	# Chemin pour la surface inférieure
+	bottom_loft.append(App.ActiveDocument.getObject(bottom.Label))
+	App.ActiveDocument.getObject("Profils_Bottom").addObject(App.ActiveDocument.getObject(bottom.Label))
+	i=i+1
+
+# Surface supérieure (face en dépression)
+top_s = App.ActiveDocument.addObject('Part::Loft','Top_Surface')
+top_s.Sections=top_loft
+top_s.Solid=False
+top_s.Ruled=False
+
+# Surface inférieure (face en pression)
+bot_s = App.ActiveDocument.addObject('Part::Loft','Bottom_Surface')
+bot_s.Sections=bottom_loft
+bot_s.Solid=False
+bot_s.Ruled=False
+
+# Groupement des surfaces pour faire la pale complete
+top_bot_s = BOPTools.JoinFeatures.makeConnect(name = 'Top_Bot_S')
+top_bot_s.Objects = [top_s, bot_s]
+top_bot_s.Refine = True
+top_bot_s.Tolerance = '0.1 mm'
+for obj in top_bot_s.ViewObject.Proxy.claimChildren():
+	obj.ViewObject.hide()
+
+# Creation surface de bout de pale
+circle_0 = Draft.makeCircle(r_e-1, face = False)
+circle_0.Placement = App.Placement(App.Vector(0,0,0),App.Rotation(App.Vector(1,0,0),90))
+
+cyl_0 = App.ActiveDocument.addObject('Part::Extrusion', 'Bout_Pale')
+cyl_0.Base = circle_0
+cyl_0.DirMode = "Custom"
+cyl_0.Dir = App.Vector(0., 1., 0.)
+cyl_0.DirLink = None
+cyl_0.LengthFwd = max_p+offset_cyl
+cyl_0.LengthRev = -min_p+offset_cyl
+cyl_0.Solid = False
+cyl_0.Reversed = False
+cyl_0.Symmetric = False
+cyl_0.TaperAngle = 0.
+cyl_0.TaperAngleRev = 0.
+cyl_0.Base.ViewObject.hide()
+
+b_pale_0 = BOPTools.JoinFeatures.makeCutout(name = 'Cutout')
+b_pale_0.Base = cyl_0
+b_pale_0.Tool = top_bot_s
+for obj in b_pale_0.ViewObject.Proxy.claimChildren():
+	obj.ViewObject.hide()
+
+b_pale_1 = CompoundTools.CompoundFilter.makeCompoundFilter(name = 'B_Pale')
+b_pale_1.Base = App.ActiveDocument.Cutout
+b_pale_1.FilterType = 'window-volume'
+b_pale_1.Invert = True
+b_pale_1.Base.ViewObject.hide()
+
+# Creation pale complete
+pale = BOPTools.JoinFeatures.makeConnect(name = 'Pale')
+pale.Objects = [top_bot_s, b_pale_1]
+pale.Refine = True
+for obj in pale.ViewObject.Proxy.claimChildren():
+	obj.ViewObject.hide()
+
+# Creation de l'ensemble des pales
+center = FreeCAD.Vector(0, 0, 0)
+pales = Draft.makeArray(pale, center, 360, n_pales, name="Pales")
+pales.Axis = (0, 1., 0.)
+
+# Creation de la surface du cylindre pied de pale
+circle_1 = Draft.makeCircle(r_p+1, face = False)
+circle_1.Placement = App.Placement(App.Vector(0,0,0),App.Rotation(App.Vector(1,0,0),90))
+
+cyl_1 = App.ActiveDocument.addObject('Part::Extrusion', 'Pied_Pale')
+cyl_1.Base = circle_1
+cyl_1.DirMode = "Custom"
+cyl_1.Dir = App.Vector(0., 1., 0.)
+cyl_1.DirLink = None
+cyl_1.LengthFwd = max_p+offset_cyl
+cyl_1.LengthRev = -min_p+offset_cyl
+cyl_1.Solid = False
+cyl_1.Reversed = False
+cyl_1.Symmetric = False
+cyl_1.TaperAngle = 0.
+cyl_1.TaperAngleRev = 0.
+cyl_1.Base.ViewObject.hide()
+
+circle_2 = Draft.makeCircle(r_p+1, face = False)
+circle_2.Placement = App.Placement(App.Vector(0,max_p+offset_cyl,0),App.Rotation(App.Vector(1,0,0),-90))
+circle_2.MakeFace = True
+
+circle_3 = Draft.makeCircle(r_p+1, face = False)
+circle_3.Placement = App.Placement(App.Vector(0,min_p-offset_cyl,0),App.Rotation(App.Vector(1,0,0),90))
+circle_3.MakeFace = True
+
+# Creation arbre d'helice
+circle_4 = Draft.makeCircle(d_arbre/2, face = False)
+circle_4.Placement = App.Placement(App.Vector(0,0,0),App.Rotation(App.Vector(1,0,0),90))
+
+cyl_2 = App.ActiveDocument.addObject('Part::Extrusion', 'Arbre_Helice')
+cyl_2.Base = circle_4
+cyl_2.DirMode = "Custom"
+cyl_2.Dir = App.Vector(0., 1., 0.)
+cyl_2.DirLink = None
+cyl_2.LengthFwd = max_p+offset_cyl
+cyl_2.LengthRev = -min_p+offset_cyl
+cyl_2.Solid = False
+cyl_2.Reversed = False
+cyl_2.Symmetric = False
+cyl_2.TaperAngle = 0.
+cyl_2.TaperAngleRev = 0.
+cyl_2.Base.ViewObject.hide()
+
+# Jonction des pales, du pied et de l'arbre
+helice_0 = BOPTools.JoinFeatures.makeConnect(name = 'Helice_0')
+helice_0.Objects = [pales, cyl_1, circle_2, circle_3,cyl_2]
+helice_0.Refine = True
+for obj in helice_0.ViewObject.Proxy.claimChildren():
+	obj.ViewObject.hide()
+
+App.ActiveDocument.recompute()
+
+# Conversion de l'helice surfacique en solide
+helice_solid = App.ActiveDocument.addObject("Part::Feature","Helice (Solide)")
+helice_solid.Label = "Helice (Solide)"
+helice_solid.Shape = Part.Solid(Part.Shell(App.ActiveDocument.Helice_0.Shape.Faces))
+
+App.ActiveDocument.recompute()
